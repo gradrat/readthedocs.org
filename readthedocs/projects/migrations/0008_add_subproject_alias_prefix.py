@@ -1,19 +1,17 @@
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
-
-from django.db import models, migrations
+from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('projects', '0007_migrate_canonical_data'),
+        ("projects", "0007_migrate_canonical_data"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='projectrelationship',
-            name='alias',
-            field=models.CharField(max_length=255, null=True, verbose_name='Alias', blank=True),
+            model_name="projectrelationship",
+            name="alias",
+            field=models.CharField(
+                max_length=255, null=True, verbose_name="Alias", blank=True
+            ),
         ),
     ]

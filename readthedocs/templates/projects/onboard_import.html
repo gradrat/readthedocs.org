@@ -2,23 +2,27 @@
 
 <!-- BEGIN onboard import project -->
 <div class="onboard onboard-import-project">
-  <h2>Ready to share your documentation{% if request.user.first_name %}, {{ request.user.first_name }}{% endif %}?</h2>
+  <h2>{% trans "Ready to share your documentation" %}{% if request.user.first_name %}, {{ request.user.first_name }}{% endif %}?</h2>
 
-  {% with getting_started_url="http://docs.readthedocs.org/en/latest/getting_started.html" %}
+  {% with tutorial_url="https://docs.readthedocs.io/page/tutorial/" template_project_url="https://github.com/readthedocs/tutorial-template/" %}
     <form method="get" action="{% url "projects_import" %}">
       <p>
-        {% blocktrans %}
+        {% blocktrans trimmed %}
           You don't have any projects yet, but you can start building documentation by importing one.
           Not sure how to start documenting your project?
-          Check out the <a href="{{ getting_started_url }}">Getting Started Guide</a> to learn how.
+          Check out the <a href="{{ tutorial_url }}">Tutorial</a> to learn how.
         {% endblocktrans %}
       </p>
 
       <p>
-        Want to try a demo? <a href="{% url "projects_import_demo" %}">Import our own demo project</a>.
+        {% url "projects_import" as projects_import_url %}
+        {% blocktrans trimmed %}
+          In a hurry? <a href="{{ template_project_url }}">Fork our template project</a> on Github,
+          and <a href="{{ projects_import_url }}">import it</a>.
+        {% endblocktrans %}
       </p>
 
-      <input type="submit" value="Import a Project" />
+      <input type="submit" value="{% trans "Import a Project" %}"/>
     </form>
   {% endwith %}
 </div>

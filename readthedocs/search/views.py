@@ -1,104 +1,180 @@
-from pprint import pprint
+"""Search views."""
 import collections
-import os
-import json
-import logging
-import mimetypes
-import md5
+from urllib.parse import urlencode
 
-from django.core.urlresolvers import reverse
+import structlog
 from django.conf import settings
-from django.contrib.auth.models import User
-from django.http import HttpResponse, HttpResponseRedirect, Http404
-from django.shortcuts import get_object_or_404, render_to_response
-from django.template import RequestContext
-from django.views.generic import ListView
-from django.utils.datastructures import SortedDict
-from django.views.static import serve
+from django.http.response import HttpResponseRedirect
+from django.urls import reverse
+from django.views import View
+from django.views.generic import TemplateView
 
-from taggit.models import Tag
-import requests
+from readthedocs.projects.models import Project
+from readthedocs.search.api.v2.serializers import ProjectSearchSerializer
+from readthedocs.search.api.v3.executor import SearchExecutor
+from readthedocs.search.api.v3.serializers import PageSearchSerializer
+from readthedocs.search.api.v3.utils import should_use_advanced_query
+from readthedocs.search.faceted_search import ProjectSearch
 
-from readthedocs.builds.constants import LATEST
-from readthedocs.builds.filters import VersionSlugFilter
-from readthedocs.builds.models import Version
-from readthedocs.projects.models import Project, ImportedFile
-from readthedocs.search.indexes import PageIndex
-from readthedocs.search import lib as search_lib
+log = structlog.get_logger(__name__)
+
+UserInput = collections.namedtuple(
+    "UserInput",
+    (
+        "query",
+        "type",
+        "language",
+    ),
+)
 
 
-log = logging.getLogger(__name__)
-LOG_TEMPLATE = u"(Elastic Search) [{user}:{type}] [{project}:{version}:{language}] {msg}"
+class ProjectSearchView(View):
 
-
-def elastic_search(request):
     """
-    Use elastic search for global search
+    Search view of the ``search`` tab.
+
+    This redirects to the main search now.
+
+    Query params:
+
+    - q: search term
     """
 
-    query = request.GET.get('q')
-    type = request.GET.get('type', 'project')
-    # File Facets
-    project = request.GET.get('project')
-    version = request.GET.get('version', LATEST)
-    taxonomy = request.GET.get('taxonomy')
-    language = request.GET.get('language')
-    results = ""
+    http_method_names = ["get"]
 
-    facets = {}
+    def get(self, request, project_slug):
+        query = request.GET.get("q", "")
+        url = (
+            reverse("search")
+            + "?"
+            + urlencode({"q": f"project:{project_slug} {query}"})
+        )
+        return HttpResponseRedirect(url)
 
-    if query:
-        if type == 'project':
-            results = search_lib.search_project(request, query, language=language)
-        elif type == 'file':
-            results = search_lib.search_file(request, query, project=project,
-                                             version=version,
-                                             taxonomy=taxonomy)
 
-    if results:
-        # pre and post 1.0 compat
-        for num, hit in enumerate(results['hits']['hits']):
-            for key, val in hit['fields'].items():
-                if isinstance(val, list):
-                    results['hits']['hits'][num]['fields'][key] = val[0]
+class GlobalSearchView(TemplateView):
 
-        if 'facets' in results:
-            for facet_type in ['project', 'version', 'taxonomy', 'language']:
-                if facet_type in results['facets']:
-                    facets[facet_type] = collections.OrderedDict()
-                    for term in results['facets'][facet_type]['terms']:
-                        facets[facet_type][term['term']] = term['count']
+    """
+    Global search enabled for logged out users and anyone using the dashboard.
 
-    if settings.DEBUG:
-        print pprint(results)
-        print pprint(facets)
+    Query params:
 
-    if query:
-        user = ''
-        if request.user.is_authenticated():
-            user = request.user
-        log.info(LOG_TEMPLATE.format(
-            user=user,
-            project=project or '',
-            type=type or '',
-            version=version or '',
-            language=language or '',
-            msg=query or '',
-        ))
+    - q: search term
+    - type: type of document to search (project or file)
+    - language: project language to filter by (only valid if type is project)
+    """
 
-    return render_to_response(
-        'search/elastic_search.html',
-        {
-            # Input
-            'query': query,
-            'type': type,
-            'project': project,
-            'version': version,
-            'taxonomy': taxonomy,
-            'language': language,
-            # Results
-            'results': results,
-            'facets': facets,
-        },
-        context_instance=RequestContext(request),
-    )
+    http_method_names = ["get"]
+    max_search_results = 50
+    available_facets = ["language"]
+    template_name = "search/elastic_search.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        user_input = UserInput(
+            query=self.request.GET.get("q"),
+            type=self.request.GET.get("type", "file"),
+            language=self.request.GET.get("language"),
+        )
+        if user_input.type == "file":
+            context.update(self._searh_files())
+        else:
+            context.update(self._search_projects(user_input, self.request))
+        return context
+
+    def _searh_files(self):
+        results, facets = [], {}
+        search_query = ""
+        total_count = 0
+        query = self.request.GET.get("q")
+        if query:
+            search_executor = SearchExecutor(
+                request=self.request,
+                query=query,
+                arguments_required=False,
+                default_all=not settings.ALLOW_PRIVATE_REPOS,
+            )
+            search_query = search_executor.parser.query
+            use_advanced_query = should_use_advanced_query(search_executor.projects)
+            search = search_executor.search(use_advanced_query=use_advanced_query)
+            if search:
+                results = search[: self.max_search_results].execute()
+                facets = results.facets
+                total_count = results.hits.total["value"]
+                results = PageSearchSerializer(
+                    results,
+                    projects=search_executor.projects,
+                    many=True,
+                ).data
+
+        return {
+            "query": query,
+            "search_query": search_query,
+            "results": results,
+            "facets": facets,
+            "total_count": total_count,
+            "type": "file",
+        }
+
+    def _search_projects(self, user_input, request):
+        total_count = 0
+        projects = []
+        # If we allow private projects,
+        # we only search on projects the user belongs or have access to.
+        if settings.ALLOW_PRIVATE_REPOS:
+            projects = list(
+                Project.objects.for_user(request.user).values_list("slug", flat=True)
+            )
+
+        # Make sure we always have projects to filter by if we allow private projects.
+        if settings.ALLOW_PRIVATE_REPOS and not projects:
+            results, facets = [], {}
+        else:
+            results, facets = self._search(
+                user_input=user_input,
+                projects=projects,
+                use_advanced_query=True,
+            )
+            if results:
+                total_count = results.hits.total["value"]
+                results = ProjectSearchSerializer(results, many=True).data
+        context = user_input._asdict()
+        context.update(
+            {
+                "search_query": user_input.query,
+                "results": results,
+                "total_count": total_count,
+                "facets": facets,
+            }
+        )
+        return context
+
+    def _search(self, *, user_input, projects, use_advanced_query):
+        """Return search results and facets given a `user_input` and `projects` to filter by."""
+        if not user_input.query:
+            return [], {}
+
+        filters = {}
+        for avail_facet in self.available_facets:
+            value = getattr(user_input, avail_facet, None)
+            if value:
+                filters[avail_facet] = value
+
+        search = ProjectSearch(
+            query=user_input.query,
+            filters=filters,
+            projects=projects,
+            use_advanced_query=use_advanced_query,
+        )
+        # pep8 and blank don't agree on having a space before :.
+        results = search[: self.max_search_results].execute()  # noqa
+        facets = results.facets
+
+        # Make sure the selected facets are displayed,
+        # even when they return 0 results.
+        for facet in facets:
+            value = getattr(user_input, facet, None)
+            if value and value not in (name for name, *_ in facets[facet]):
+                facets[facet].insert(0, (value, 0, True))
+
+        return results, facets

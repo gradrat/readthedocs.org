@@ -1,84 +1,206 @@
-import os
-import json
-import shutil
-from os.path import exists
-from tempfile import mkdtemp
+from unittest.mock import patch
 
+import pytest
+from allauth.socialaccount.models import SocialAccount
 from django.contrib.auth.models import User
+from django.test import TestCase
 from django_dynamic_fixture import get
-from mock import patch, MagicMock
+from messages_extends.models import Message
 
-from readthedocs.builds.models import Build
+from readthedocs.builds import tasks as build_tasks
+from readthedocs.builds.constants import BUILD_STATUS_SUCCESS, EXTERNAL, LATEST
+from readthedocs.builds.models import Build, Version
+from readthedocs.oauth.models import RemoteRepository, RemoteRepositoryRelation
 from readthedocs.projects.models import Project
-from readthedocs.projects import tasks
-
-from readthedocs.rtd_tests.utils import make_test_git
-from readthedocs.rtd_tests.base import RTDTestCase
-from readthedocs.rtd_tests.mocks.mock_api import mock_api
 
 
-class TestCeleryBuilding(RTDTestCase):
+class TestCeleryBuilding(TestCase):
 
-    """These tests run the build functions directly. They don't use celery"""
+    """
+    These tests run the build functions directly.
+
+    They don't use celery
+    """
 
     def setUp(self):
-        repo = make_test_git()
-        self.repo = repo
-        super(TestCeleryBuilding, self).setUp()
-        self.eric = User(username='eric')
-        self.eric.set_password('test')
+        super().setUp()
+        self.eric = User(username="eric")
+        self.eric.set_password("test")
         self.eric.save()
         self.project = Project.objects.create(
             name="Test Project",
-            repo_type="git",
-            # Our top-level checkout
-            repo=repo,
         )
         self.project.users.add(self.eric)
+        self.version = self.project.versions.get(slug=LATEST)
 
-    def tearDown(self):
-        shutil.rmtree(self.repo)
-        super(TestCeleryBuilding, self).tearDown()
+    @pytest.mark.skip
+    def test_check_duplicate_no_reserved_version(self):
+        create_git_branch(self.repo, "no-reserved")
+        create_git_tag(self.repo, "no-reserved")
 
-    def test_remove_dir(self):
-        directory = mkdtemp()
-        self.assertTrue(exists(directory))
-        result = tasks.remove_dir.delay(directory)
-        self.assertTrue(result.successful())
-        self.assertFalse(exists(directory))
+        version = self.project.versions.get(slug=LATEST)
 
-    def test_clear_artifacts(self):
-        version = self.project.versions.all()[0]
-        directory = self.project.get_production_media_path(type_='pdf', version_slug=version.slug)
-        os.makedirs(directory)
-        self.assertTrue(exists(directory))
-        result = tasks.clear_artifacts.delay(version_pk=version.pk)
-        self.assertTrue(result.successful())
-        self.assertFalse(exists(directory))
+        self.assertEqual(
+            self.project.versions.filter(slug__startswith="no-reserved").count(), 0
+        )
 
-        directory = version.project.rtd_build_path(version=version.slug)
-        os.makedirs(directory)
-        self.assertTrue(exists(directory))
-        result = tasks.clear_artifacts.delay(version_pk=version.pk)
-        self.assertTrue(result.successful())
-        self.assertFalse(exists(directory))
+        sync_repository_task(version_id=version.pk)
 
-    @patch('readthedocs.projects.tasks.UpdateDocsTask.build_docs',
-           new=MagicMock)
-    @patch('readthedocs.projects.tasks.UpdateDocsTask.setup_vcs',
-           new=MagicMock)
-    def test_update_docs(self):
-        build = get(Build, project=self.project,
-                    version=self.project.versions.first())
-        with mock_api(self.repo) as mapi:
-            result = tasks.update_docs.delay(
-                self.project.pk,
-                build_pk=build.pk,
-                record=False,
-                intersphinx=False)
-        self.assertTrue(result.successful())
+        self.assertEqual(
+            self.project.versions.filter(slug__startswith="no-reserved").count(), 2
+        )
 
-    def test_update_imported_doc(self):
-        with mock_api(self.repo):
-            result = tasks.update_imported_docs.delay(self.project.pk)
-        self.assertTrue(result.successful())
+    def test_public_task_exception(self):
+        """
+        Test when a PublicTask rises an Exception.
+
+        The exception should be caught and added to the ``info`` attribute of
+        the result. Besides, the task should be SUCCESS.
+        """
+        from readthedocs.core.utils.tasks import PublicTask
+        from readthedocs.worker import app
+
+        @app.task(name="public_task_exception", base=PublicTask)
+        def public_task_exception():
+            raise Exception("Something bad happened")
+
+        result = public_task_exception.delay()
+
+        # although the task risen an exception, it's success since we add the
+        # exception into the ``info`` attributes
+        self.assertEqual(result.status, "SUCCESS")
+        self.assertEqual(
+            result.info,
+            {
+                "task_name": "public_task_exception",
+                "context": {},
+                "public_data": {},
+                "error": "Something bad happened",
+            },
+        )
+
+    @patch("readthedocs.oauth.services.github.GitHubService.send_build_status")
+    def test_send_build_status_with_remote_repo_github(self, send_build_status):
+        self.project.repo = "https://github.com/test/test/"
+        self.project.save()
+
+        social_account = get(SocialAccount, user=self.eric, provider="gitlab")
+        remote_repo = get(RemoteRepository)
+        remote_repo.projects.add(self.project)
+        get(
+            RemoteRepositoryRelation,
+            remote_repository=remote_repo,
+            user=self.eric,
+            account=social_account,
+        )
+
+        external_version = get(Version, project=self.project, type=EXTERNAL)
+        external_build = get(Build, project=self.project, version=external_version)
+        build_tasks.send_build_status(
+            external_build.id, external_build.commit, BUILD_STATUS_SUCCESS
+        )
+
+        send_build_status.assert_called_once_with(
+            external_build,
+            external_build.commit,
+            BUILD_STATUS_SUCCESS,
+        )
+        self.assertEqual(Message.objects.filter(user=self.eric).count(), 0)
+
+    @patch("readthedocs.oauth.services.github.GitHubService.send_build_status")
+    def test_send_build_status_with_social_account_github(self, send_build_status):
+        social_account = get(SocialAccount, user=self.eric, provider="github")
+
+        self.project.repo = "https://github.com/test/test/"
+        self.project.save()
+
+        external_version = get(Version, project=self.project, type=EXTERNAL)
+        external_build = get(Build, project=self.project, version=external_version)
+        build_tasks.send_build_status(
+            external_build.id, external_build.commit, BUILD_STATUS_SUCCESS
+        )
+
+        send_build_status.assert_called_once_with(
+            external_build,
+            external_build.commit,
+            BUILD_STATUS_SUCCESS,
+        )
+        self.assertEqual(Message.objects.filter(user=self.eric).count(), 0)
+
+    @patch("readthedocs.oauth.services.github.GitHubService.send_build_status")
+    def test_send_build_status_no_remote_repo_or_social_account_github(
+        self, send_build_status
+    ):
+        self.project.repo = "https://github.com/test/test/"
+        self.project.save()
+        external_version = get(Version, project=self.project, type=EXTERNAL)
+        external_build = get(Build, project=self.project, version=external_version)
+        build_tasks.send_build_status(
+            external_build.id, external_build.commit, BUILD_STATUS_SUCCESS
+        )
+
+        send_build_status.assert_not_called()
+        self.assertEqual(Message.objects.filter(user=self.eric).count(), 1)
+
+    @patch("readthedocs.oauth.services.gitlab.GitLabService.send_build_status")
+    def test_send_build_status_with_remote_repo_gitlab(self, send_build_status):
+        self.project.repo = "https://gitlab.com/test/test/"
+        self.project.save()
+
+        social_account = get(SocialAccount, user=self.eric, provider="gitlab")
+        remote_repo = get(RemoteRepository)
+        remote_repo.projects.add(self.project)
+        get(
+            RemoteRepositoryRelation,
+            remote_repository=remote_repo,
+            user=self.eric,
+            account=social_account,
+        )
+
+        external_version = get(Version, project=self.project, type=EXTERNAL)
+        external_build = get(Build, project=self.project, version=external_version)
+        build_tasks.send_build_status(
+            external_build.id, external_build.commit, BUILD_STATUS_SUCCESS
+        )
+
+        send_build_status.assert_called_once_with(
+            external_build,
+            external_build.commit,
+            BUILD_STATUS_SUCCESS,
+        )
+        self.assertEqual(Message.objects.filter(user=self.eric).count(), 0)
+
+    @patch("readthedocs.oauth.services.gitlab.GitLabService.send_build_status")
+    def test_send_build_status_with_social_account_gitlab(self, send_build_status):
+        social_account = get(SocialAccount, user=self.eric, provider="gitlab")
+
+        self.project.repo = "https://gitlab.com/test/test/"
+        self.project.save()
+
+        external_version = get(Version, project=self.project, type=EXTERNAL)
+        external_build = get(Build, project=self.project, version=external_version)
+        build_tasks.send_build_status(
+            external_build.id, external_build.commit, BUILD_STATUS_SUCCESS
+        )
+
+        send_build_status.assert_called_once_with(
+            external_build,
+            external_build.commit,
+            BUILD_STATUS_SUCCESS,
+        )
+        self.assertEqual(Message.objects.filter(user=self.eric).count(), 0)
+
+    @patch("readthedocs.oauth.services.gitlab.GitLabService.send_build_status")
+    def test_send_build_status_no_remote_repo_or_social_account_gitlab(
+        self, send_build_status
+    ):
+        self.project.repo = "https://gitlab.com/test/test/"
+        self.project.save()
+        external_version = get(Version, project=self.project, type=EXTERNAL)
+        external_build = get(Build, project=self.project, version=external_version)
+        build_tasks.send_build_status(
+            external_build.id, external_build.commit, BUILD_STATUS_SUCCESS
+        )
+
+        send_build_status.assert_not_called()
+        self.assertEqual(Message.objects.filter(user=self.eric).count(), 1)

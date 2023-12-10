@@ -1,88 +1,166 @@
-from django.conf.urls import url, patterns, include
-from django.contrib import admin
+import os
+from functools import reduce
+from operator import add
+
 from django.conf import settings
 from django.conf.urls.static import static
-from django.views.generic.base import TemplateView
+from django.contrib import admin
+from django.urls import include, path, re_path
+from django.views.generic.base import RedirectView, TemplateView
 
-from tastypie.api import Api
-
-from readthedocs.api.base import (ProjectResource, UserResource,
-                                  VersionResource, FileResource)
-from readthedocs.core.views import HomepageView
-
-from readthedocs.core.urls import docs_urls, core_urls, deprecated_urls
-
-v1_api = Api(api_name='v1')
-v1_api.register(UserResource())
-v1_api.register(ProjectResource())
-v1_api.register(VersionResource())
-v1_api.register(FileResource())
+from readthedocs.core.views import (
+    HomepageView,
+    SupportView,
+    do_not_track,
+    server_error_500,
+)
+from readthedocs.search.views import GlobalSearchView
 
 admin.autodiscover()
 
-handler500 = 'readthedocs.core.views.server_error'
-handler404 = 'readthedocs.core.views.server_error_404'
+handler500 = server_error_500
 
+basic_urls = [
+    path("", HomepageView.as_view(), name="homepage"),
+    path("security/", TemplateView.as_view(template_name="security.html")),
+    re_path(
+        r"^\.well-known/security.txt$",
+        TemplateView.as_view(template_name="security.txt", content_type="text/plain"),
+    ),
+    path("support/", SupportView.as_view(), name="support"),
+    # These are redirected to from the support form
+    path(
+        "support/success/",
+        TemplateView.as_view(template_name="support/success.html"),
+        name="support_success",
+    ),
+    path(
+        "support/error/",
+        TemplateView.as_view(template_name="support/error.html"),
+        name="support_error",
+    ),
+]
 
-urlpatterns = patterns(
-    '',  # base view, flake8 complains if it is on the previous line.
-    url(r'^$', HomepageView.as_view(), name='homepage'),
-    url(r'^security/', TemplateView.as_view(template_name='security.html')),
-)
-
-rtd_urls = patterns(
-    '',
-    url(r'^projects/', include('readthedocs.projects.urls.public')),
-    url(r'^bookmarks/', include('readthedocs.bookmarks.urls')),
-    url(r'^search/$', 'readthedocs.search.views.elastic_search', name='search'),
-    url(r'^dashboard/', include('readthedocs.projects.urls.private')),
-    url(r'^profiles/', include('readthedocs.profiles.urls.public')),
-    url(r'^accounts/', include('readthedocs.profiles.urls.private')),
-    url(r'^accounts/', include('allauth.urls')),
+rtd_urls = [
+    path("search/", GlobalSearchView.as_view(), name="search"),
+    path("dashboard/", include("readthedocs.projects.urls.private")),
+    path("profiles/", include("readthedocs.profiles.urls.public")),
+    path("accounts/", include("readthedocs.profiles.urls.private")),
+    path("accounts/", include("allauth.urls")),
+    path("notifications/", include("readthedocs.notifications.urls")),
+    path("accounts/gold/", include("readthedocs.gold.urls")),
+    path("invitations/", include("readthedocs.invitations.urls")),
     # For redirects
-    url(r'^builds/', include('readthedocs.builds.urls')),
-)
+    path("builds/", include("readthedocs.builds.urls")),
+    # For testing the 500's with DEBUG on.
+    path("500/", handler500),
+    # Put this as a unique path for the webhook, so we don't clobber existing Stripe URL's
+    path("djstripe/", include("djstripe.urls", namespace="djstripe")),
+]
 
-api_urls = patterns(
-    '',
-    url(r'^api/', include(v1_api.urls)),
-    url(r'^api/v2/', include('readthedocs.restapi.urls')),
-    url(r'^api-auth/', include('rest_framework.urls', namespace='rest_framework')),
-    url(r'^websupport/', include('readthedocs.comments.urls')),
-)
+project_urls = [
+    path("projects/", include("readthedocs.projects.urls.public")),
+]
 
-i18n_urls = patterns(
-    '',
-    url(r'^i18n/', include('django.conf.urls.i18n')),
-)
 
-admin_urls = patterns(
-    '',
-    url(r'^admin/', include(admin.site.urls)),
-)
+organization_urls = [
+    path(
+        "organizations/",
+        include("readthedocs.organizations.urls.private"),
+    ),
+    path(
+        "organizations/",
+        include("readthedocs.organizations.urls.public"),
+    ),
+    re_path(
+        r"^organizations/(?P<slug>[\w.-]+)/subscription/",
+        include("readthedocs.subscriptions.urls"),
+    ),
+    # NOTE: This is overridden in .com to serve a real pricing page.
+    path(
+        "pricing/",
+        RedirectView.as_view(url="https://readthedocs.org/sustainability/"),
+        name="pricing",
+    ),
+]
 
-money_urls = patterns(
-    '',
-    url(r'^sustainability/', include('readthedocs.donate.urls')),
-    url(r'^accounts/gold/', include('readthedocs.gold.urls')),
-)
 
-if not getattr(settings, 'USE_SUBDOMAIN', False):
-    urlpatterns += docs_urls
+api_urls = [
+    path("api/v2/", include("readthedocs.api.v2.urls")),
+    # Keep `search_api` at root level, so the test does not fail for other API
+    path("api/v2/search/", include("readthedocs.search.api.v2.urls")),
+    path("api/v3/search/", include("readthedocs.search.api.v3.urls")),
+    # Deprecated
+    path("api/v1/embed/", include("readthedocs.embed.urls")),
+    path("api/v2/embed/", include("readthedocs.embed.urls")),
+    path("api-auth/", include("rest_framework.urls", namespace="rest_framework")),
+    path("api/v3/", include("readthedocs.api.v3.urls")),
+    path("api/v3/embed/", include("readthedocs.embed.v3.urls")),
+]
 
-urlpatterns += rtd_urls
-urlpatterns += api_urls
-urlpatterns += core_urls
-urlpatterns += i18n_urls
-urlpatterns += money_urls
-urlpatterns += deprecated_urls
+i18n_urls = [
+    path("i18n/", include("django.conf.urls.i18n")),
+]
 
-if getattr(settings, 'ALLOW_ADMIN', True):
-    urlpatterns += admin_urls
+admin_urls = [
+    re_path(r"^admin/", admin.site.urls),
+]
 
-if settings.DEBUG:
-    urlpatterns += patterns(
-        '',  # base view, flake8 complains if it is on the previous line.
-        url('style-catalog/$',
-            TemplateView.as_view(template_name='style_catalog.html')),
-    ) + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+dnt_urls = [
+    re_path(r"^\.well-known/dnt/$", do_not_track),
+    # https://github.com/EFForg/dnt-guide#12-how-to-assert-dnt-compliance
+    re_path(
+        r"^\.well-known/dnt-policy.txt$",
+        TemplateView.as_view(template_name="dnt-policy.txt", content_type="text/plain"),
+    ),
+]
+
+debug_urls = []
+for build_format in ("epub", "htmlzip", "json", "pdf"):
+    debug_urls += static(
+        settings.MEDIA_URL + build_format,
+        document_root=os.path.join(settings.MEDIA_ROOT, build_format),
+    )
+debug_urls += [
+    path(
+        "style-catalog/",
+        TemplateView.as_view(template_name="style_catalog.html"),
+    ),
+    # This must come last after the build output files
+    path(
+        "media/<path:remainder>",
+        RedirectView.as_view(url=settings.STATIC_URL + "%(remainder)s"),
+        name="media-redirect",
+    ),
+]
+
+# Export URLs
+groups = [
+    basic_urls,
+    rtd_urls,
+    project_urls,
+    organization_urls,
+    api_urls,
+    i18n_urls,
+]
+
+if settings.DO_NOT_TRACK_ENABLED:
+    # Include Do Not Track URLs if DNT is supported
+    groups.append(dnt_urls)
+
+
+if settings.READ_THE_DOCS_EXTENSIONS:
+    groups.append([path("", include("readthedocsext.urls"))])
+
+if settings.ALLOW_ADMIN:
+    groups.append(admin_urls)
+
+if settings.SHOW_DEBUG_TOOLBAR:
+    import debug_toolbar
+
+    debug_urls += [
+        path("__debug__/", include(debug_toolbar.urls)),
+    ]
+    groups.append(debug_urls)
+
+urlpatterns = reduce(add, groups)

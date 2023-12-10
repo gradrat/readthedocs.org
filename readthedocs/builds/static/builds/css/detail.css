@@ -19,7 +19,8 @@ div.build-detail div.build-state {
 }
 
 div.build-detail div.build-state > span.build-state-successful,
-div.build-detail div.build-state > span.build-state-failed {
+div.build-detail div.build-state > span.build-state-failed,
+div.build-detail div.build-state > span.build-state-cancelled {
     padding: .3em .5em;
     border-radius: .3em;
     -moz-border-radius: .3em;
@@ -28,11 +29,16 @@ div.build-detail div.build-state > span.build-state-failed {
     color: white;
 }
 
-div.build-detail div.build-state > span.build-state-failed {
+div.build-detail div.build-state > span.build-state-failed,
+div.build-detail div.build-state > span.build-state-cancelled {
     background: #a55;
 }
 div.build-detail div.build-state > span.build-state-successful {
     background: #5a5;
+}
+
+div.build-detail div.build-ideas {
+    padding: .5em;
 }
 
 ul.build-meta {
@@ -110,8 +116,7 @@ div.build-command div.build-command-output {
 div.build-command div.build-command-run > span,
 div.build-command div.build-command-output > span {
     display: block;
-    margin-bottom: -16px;
-    font-family: Consolas, "Liberation Mono", Menlo, Courier, monospace;
+    font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", Courier, monospace;
     white-space: pre;
     overflow-x: scroll;
     overflow-y: hidden;
@@ -120,7 +125,7 @@ div.build-command div.build-command-output > span {
 div.build-command div.build-command-run > span::-webkit-scrollbar,
 div.build-command div.build-command-output > span::-webkit-scrollbar {
     -webkit-appearance: none;
-    height: 15px;
+    height: 0px;
 }
 
 div.build-command div.build-command-output > span {
@@ -135,7 +140,7 @@ div.build-command div.build-command-meta {
 
 div.build-command div.build-command-meta {
     padding: .5em;
-    font-family: Consolas, "Liberation Mono", Menlo, Courier, monospace;
+    font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", Courier, monospace;
     text-align: right;
     color: #bba;
 }

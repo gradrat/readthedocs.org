@@ -1,46 +1,70 @@
-from django.utils.translation import ugettext_lazy as _
+"""Filters used in project dashboard."""
 
-import django_filters
+import structlog
+from django.forms.widgets import HiddenInput
+from django.utils.translation import gettext_lazy as _
+from django_filters import CharFilter, ChoiceFilter, FilterSet
 
-from readthedocs.builds import constants
-from readthedocs.builds.models import Build, Version
-
-
-ANY_REPO = (
-    ('', _('Any')),
+from readthedocs.builds.constants import (
+    BUILD_FINAL_STATES,
+    BUILD_STATE_FINISHED,
+    EXTERNAL,
 )
 
-BUILD_TYPES = ANY_REPO + constants.BUILD_TYPES
+log = structlog.get_logger(__name__)
 
 
-class VersionSlugFilter(django_filters.FilterSet):
+class BuildListFilter(FilterSet):
 
-    class Meta:
-        model = Version
-        fields = {
-            'identifier': ['icontains'],
-            'slug': ['icontains'],
-        }
+    """Project build list dashboard filter."""
 
+    STATE_ACTIVE = "active"
+    STATE_SUCCESS = "succeeded"
+    STATE_FAILED = "failed"
 
-class VersionFilter(django_filters.FilterSet):
-    project = django_filters.CharFilter(name='project__slug')
-    # Allow filtering on slug= or version=
-    slug = django_filters.CharFilter(label=_("Name"), name='slug',
-                                     lookup_type='exact')
-    version = django_filters.CharFilter(label=_("Version"), name='slug',
-                                        lookup_type='exact')
+    STATE_CHOICES = (
+        (STATE_ACTIVE, _("Active")),
+        (STATE_SUCCESS, _("Build successful")),
+        (STATE_FAILED, _("Build failed")),
+    )
 
-    class Meta:
-        model = Version
-        fields = ['project', 'slug', 'version']
+    TYPE_NORMAL = "normal"
+    TYPE_EXTERNAL = "external"
+    TYPE_CHOICES = (
+        (TYPE_NORMAL, _("Normal")),
+        (TYPE_EXTERNAL, _("Pull/merge request")),
+    )
 
+    # Attribute filter fields
+    version = CharFilter(field_name="version__slug", widget=HiddenInput)
+    state = ChoiceFilter(
+        label=_("State"),
+        choices=STATE_CHOICES,
+        empty_label=_("Any"),
+        method="get_state",
+    )
+    version__type = ChoiceFilter(
+        label=_("Type"),
+        choices=TYPE_CHOICES,
+        empty_label=_("Any"),
+        method="get_version_type",
+    )
 
-class BuildFilter(django_filters.FilterSet):
-    date = django_filters.DateRangeFilter(label=_("Build Date"), name="date", lookup_type='range')
-    type = django_filters.ChoiceFilter(label=_("Build Type"),
-                                       choices=BUILD_TYPES)
+    def get_state(self, queryset, _, value):
+        if value == self.STATE_ACTIVE:
+            queryset = queryset.exclude(state__in=BUILD_FINAL_STATES)
+        elif value == self.STATE_SUCCESS:
+            queryset = queryset.filter(state=BUILD_STATE_FINISHED, success=True)
+        elif value == self.STATE_FAILED:
+            queryset = queryset.filter(
+                state__in=BUILD_FINAL_STATES,
+                success=False,
+            )
+        return queryset
 
-    class Meta:
-        model = Build
-        fields = ['type', 'date', 'success']
+    def get_version_type(self, queryset, _, value):
+        if value == self.TYPE_NORMAL:
+            queryset = queryset.exclude(version__type=EXTERNAL)
+        elif value == self.TYPE_EXTERNAL:
+            queryset = queryset.filter(version__type=EXTERNAL)
+        return queryset

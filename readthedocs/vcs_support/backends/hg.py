@@ -1,73 +1,79 @@
-from readthedocs.projects.exceptions import ProjectImportError
+"""Mercurial-related utilities."""
+from readthedocs.projects.exceptions import RepositoryError
 from readthedocs.vcs_support.base import BaseVCS, VCSVersion
 
 
 class Backend(BaseVCS):
+
+    """Mercurial VCS backend."""
+
     supports_tags = True
     supports_branches = True
-    fallback_branch = 'default'
+    fallback_branch = "default"
 
     def update(self):
-        super(Backend, self).update()
-        retcode = self.run('hg', 'status')[0]
-        if retcode == 0:
-            return self.pull()
-        else:
-            return self.clone()
-
-    def pull(self):
-        pull_output = self.run('hg', 'pull')
-        if pull_output[0] != 0:
-            raise ProjectImportError(
-                ("Failed to get code from '%s' (hg pull): %s"
-                 % (self.repo_url, pull_output[0]))
-            )
-        update_output = self.run('hg', 'update', '-C')[0]
-        if update_output[0] != 0:
-            raise ProjectImportError(
-                ("Failed to get code from '%s' (hg update): %s"
-                 % (self.repo_url, pull_output[0]))
-            )
-        return update_output
+        super().update()
+        return self.clone()
 
     def clone(self):
         self.make_clean_working_dir()
-        output = self.run('hg', 'clone', self.repo_url, '.')
-        if output[0] != 0:
-            raise ProjectImportError(
-                ("Failed to get code from '%s' (hg clone): %s"
-                 % (self.repo_url, output[0]))
+        try:
+            # Disable sparse-revlog extension when cloning because it's not
+            # included in older versions of Mercurial and producess an error
+            # when using an old version. See
+            # https://github.com/readthedocs/readthedocs.org/pull/9042/
+
+            output = self.run(
+                "hg", "clone", "--config", "format.sparse-revlog=no", self.repo_url, "."
             )
-        return output
+            return output
+        except RepositoryError:
+            raise RepositoryError(RepositoryError.CLONE_ERROR())
 
     @property
     def branches(self):
-        retcode, stdout = self.run('hg', 'branches', '-q')[:2]
-        # error (or no tags found)
-        if retcode != 0:
+        try:
+            _, stdout, _ = self.run(
+                "hg",
+                "branches",
+                "--quiet",
+                record_as_success=True,
+            )
+            return self.parse_branches(stdout)
+        except RepositoryError:
+            # error (or no tags found)
             return []
-        return self.parse_branches(stdout)
 
     def parse_branches(self, data):
         """
-        stable
-        default
-        """
+        Parses output of `hg branches --quiet`.
 
+        Example:
+
+            default
+            0.2
+            0.1
+
+        Into VCSVersion objects with branch name as verbose_name and
+        identifier.
+        """
         names = [name.lstrip() for name in data.splitlines()]
         return [VCSVersion(self, name, name) for name in names if name]
 
     @property
     def tags(self):
-        retcode, stdout = self.run('hg', 'tags')[:2]
-        # error (or no tags found)
-        if retcode != 0:
+        try:
+            _, stdout, _ = self.run("hg", "tags", record_as_success=True)
+            return self.parse_tags(stdout)
+        except RepositoryError:
+            # error (or no tags found)
             return []
-        return self.parse_tags(stdout)
 
     def parse_tags(self, data):
         """
-        Parses output of `hg tags`, eg:
+        Parses output of `hg tags`.
+
+        Example:
 
             tip                              278:c4b2d21db51a
             0.2.2                            152:6b0364d98837
@@ -87,25 +93,31 @@ class Backend(BaseVCS):
             if len(row) != 2:
                 continue
             name, commit = row
-            if name == 'tip':
+            if name == "tip":
                 continue
-            revision, commit_hash = commit.split(':')
+            _, commit_hash = commit.split(":")
             vcs_tags.append(VCSVersion(self, commit_hash, name))
         return vcs_tags
 
     @property
     def commit(self):
-        retcode, stdout = self.run('hg', 'id', '-i')[:2]
+        _, stdout = self.run("hg", "identify", "--id")[:2]
         return stdout.strip()
 
     def checkout(self, identifier=None):
-        super(Backend, self).checkout()
+        super().checkout()
         if not identifier:
-            identifier = 'tip'
-        retcode = self.run('hg', 'status')[0]
-        if retcode == 0:
-            self.run('hg', 'pull')
-            return self.run('hg', 'update', '-C', identifier)
-        else:
-            self.clone()
-            return self.run('hg', 'update', '-C', identifier)
+            identifier = "tip"
+
+        try:
+            code, stdout, stderr = self.run(
+                "hg",
+                "update",
+                "--clean",
+                identifier,
+            )
+            return code, stdout, stderr
+        except RepositoryError:
+            raise RepositoryError(
+                RepositoryError.FAILED_TO_CHECKOUT.format(identifier),
+            )

@@ -1,255 +1,276 @@
-"""
-Views for creating, editing and viewing site-specific user profiles.
+"""Views for creating, editing and viewing site-specific user profiles."""
 
-"""
-
-from django.contrib.auth.decorators import login_required
+from allauth.account.views import LoginView as AllAuthLoginView
+from allauth.account.views import LogoutView as AllAuthLogoutView
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth import logout
 from django.contrib.auth.models import User
-from django.core.exceptions import ObjectDoesNotExist
-from django.core.urlresolvers import reverse
-from django.http import Http404
-from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404
-from django.shortcuts import render_to_response
-from django.template import RequestContext
+from django.contrib.messages.views import SuccessMessageMixin
+from django.http import Http404, HttpResponseRedirect
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from rest_framework.authtoken.models import Token
+from vanilla import CreateView, DeleteView, DetailView, FormView, ListView, UpdateView
+
+from readthedocs.audit.filters import UserSecurityLogFilter
+from readthedocs.audit.models import AuditLog
+from readthedocs.core.forms import UserAdvertisingForm, UserDeleteForm, UserProfileForm
+from readthedocs.core.history import set_change_reason
+from readthedocs.core.mixins import PrivateViewMixin
+from readthedocs.core.models import UserProfile
+from readthedocs.core.permissions import AdminPermission
+from readthedocs.core.utils.extend import SettingsOverrideObject
+from readthedocs.organizations.models import Organization
+from readthedocs.projects.models import Project
+from readthedocs.projects.utils import get_csv_file
 
 
-def create_profile(request, form_class, success_url=None,
-                   template_name='profiles/private/create_profile.html',
-                   extra_context=None):
-    """
-    Create a profile for the current user, if one doesn't already
-    exist.
-
-    If the user already has a profile, a redirect will be issued to the
-    :view:`profiles.views.edit_profile` view.
-
-    **Optional arguments:**
-
-    ``extra_context``
-        A dictionary of variables to add to the template context. Any
-        callable object in this dictionary will be called to produce
-        the end result which appears in the context.
-
-    ``form_class``
-        The form class to use for validating and creating the user
-        profile. This form class must define a method named
-        ``save()``, implementing the same argument signature as the
-        ``save()`` method of a standard Django ``ModelForm`` (this
-        view will call ``save(commit=False)`` to obtain the profile
-        object, and fill in the user before the final save). If the
-        profile object includes many-to-many relations, the convention
-        established by ``ModelForm`` of using a method named
-        ``save_m2m()`` will be used, and so your form class should
-        also define this method.
-
-    ``success_url``
-        The URL to redirect to after successful profile creation. If
-        this argument is not supplied, this will default to the URL of
-        :view:`profiles.views.profile_detail` for the newly-created
-        profile object.
-
-    ``template_name``
-        The template to use when displaying the profile-creation
-        form. If not supplied, this will default to
-        :template:`profiles/create_profile.html`.
-
-    **Context:**
-
-    ``form``
-        The profile-creation form.
-
-    **Template:**
-
-    ``template_name`` keyword argument, or
-    :template:`profiles/create_profile.html`.
-
-    """
-    try:
-        profile_obj = request.user.profile
-        return HttpResponseRedirect(reverse('profiles_edit_profile'))
-    except ObjectDoesNotExist:
-        pass
-
-    #
-    # We set up success_url here, rather than as the default value for
-    # the argument. Trying to do it as the argument's default would
-    # mean evaluating the call to reverse() at the time this module is
-    # first imported, which introduces a circular dependency: to
-    # perform the reverse lookup we need access to profiles/urls.py,
-    # but profiles/urls.py in turn imports this module.
-    #
-
-    if success_url is None:
-        success_url = reverse('profiles_profile_detail',
-                              kwargs={'username': request.user.username})
-    if request.method == 'POST':
-        form = form_class(data=request.POST, files=request.FILES)
-        if form.is_valid():
-            profile_obj = form.save(commit=False)
-            profile_obj.user = request.user
-            profile_obj.save()
-            if hasattr(form, 'save_m2m'):
-                form.save_m2m()
-            return HttpResponseRedirect(success_url)
-    else:
-        form = form_class()
-
-    if extra_context is None:
-        extra_context = {}
-    context = RequestContext(request)
-    for key, value in extra_context.items():
-        context[key] = callable(value) and value() or value
-
-    return render_to_response(template_name,
-                              {'form': form},
-                              context_instance=context)
-create_profile = login_required(create_profile)
+class LoginViewBase(AllAuthLoginView):
+    pass
 
 
-def edit_profile(request, form_class, success_url=None,
-                 template_name='profiles/private/edit_profile.html',
-                 extra_context=None):
-    """
-    Edit the current user's profile.
-
-    If the user does not already have a profile, a redirect will be issued to
-    the :view:`profiles.views.create_profile` view.
-
-    **Optional arguments:**
-
-    ``extra_context``
-        A dictionary of variables to add to the template context. Any
-        callable object in this dictionary will be called to produce
-        the end result which appears in the context.
-
-    ``form_class``
-        The form class to use for validating and editing the user
-        profile. This form class must operate similarly to a standard
-        Django ``ModelForm`` in that it must accept an instance of the
-        object to be edited as the keyword argument ``instance`` to
-        its constructor, and it must implement a method named
-        ``save()`` which will save the updates to the object.
-
-    ``success_url``
-        The URL to redirect to following a successful edit. If not
-        specified, this will default to the URL of
-        :view:`profiles.views.profile_detail` for the profile object
-        being edited.
-
-    ``template_name``
-        The template to use when displaying the profile-editing
-        form. If not specified, this will default to
-        :template:`profiles/edit_profile.html`.
-
-    **Context:**
-
-    ``form``
-        The form for editing the profile.
-
-    ``profile``
-         The user's current profile.
-
-    **Template:**
-
-    ``template_name`` keyword argument or
-    :template:`profiles/edit_profile.html`.
-
-    """
-    try:
-        profile_obj = request.user.profile
-    except ObjectDoesNotExist:
-        return HttpResponseRedirect(reverse('profiles_profile_create'))
-
-    if success_url is None:
-        success_url = reverse('profiles_profile_detail',
-                              kwargs={'username': request.user.username})
-    if request.method == 'POST':
-        form = form_class(data=request.POST, files=request.FILES, instance=profile_obj)
-        if form.is_valid():
-            form.save()
-            return HttpResponseRedirect(success_url)
-    else:
-        form = form_class(instance=profile_obj)
-
-    if extra_context is None:
-        extra_context = {}
-    context = RequestContext(request)
-    for key, value in extra_context.items():
-        context[key] = callable(value) and value() or value
-
-    return render_to_response(template_name, {
-        'form': form,
-        'profile': profile_obj,
-        'user': profile_obj.user,
-    }, context_instance=context)
-edit_profile = login_required(edit_profile)
+class LoginView(SettingsOverrideObject):
+    _default_class = LoginViewBase
 
 
-def profile_detail(request, username, public_profile_field=None,
-                   template_name='profiles/public/profile_detail.html',
-                   extra_context=None):
-    """
-    Detail view of a user's profile.
+class LogoutViewBase(AllAuthLogoutView):
+    pass
 
-    If the user has not yet created a profile, ``Http404`` will be
-    raised.
 
-    **Required arguments:**
+class LogoutView(SettingsOverrideObject):
+    _default_class = LogoutViewBase
 
-    ``username``
-        The username of the user whose profile is being displayed.
 
-    **Optional arguments:**
+class ProfileEdit(PrivateViewMixin, UpdateView):
 
-    ``extra_context``
-        A dictionary of variables to add to the template context. Any
-        callable object in this dictionary will be called to produce
-        the end result which appears in the context.
+    """Edit the current user's profile."""
 
-    ``public_profile_field``
-        The name of a ``BooleanField`` on the profile model; if the
-        value of that field on the user's profile is ``False``, the
-        ``profile`` variable in the template will be ``None``. Use
-        this feature to allow users to mark their profiles as not
-        being publicly viewable.
+    model = UserProfile
+    form_class = UserProfileForm
+    template_name = "profiles/private/edit_profile.html"
+    context_object_name = "profile"
 
-        If this argument is not specified, it will be assumed that all
-        users' profiles are publicly viewable.
+    def get_object(self):
+        return self.request.user.profile
 
-    ``template_name``
-        The name of the template to use for displaying the profile. If
-        not specified, this will default to
-        :template:`profiles/profile_detail.html`.
+    def get_success_url(self):
+        return reverse(
+            "profiles_profile_edit",
+        )
 
-    **Context:**
 
-    ``profile``
-        The user's profile, or ``None`` if the user's profile is not
-        publicly viewable (see the description of
-        ``public_profile_field`` above).
+class AccountDelete(PrivateViewMixin, SuccessMessageMixin, FormView):
+    form_class = UserDeleteForm
+    template_name = "profiles/private/delete_account.html"
+    success_message = _("You have successfully deleted your account")
 
-    **Template:**
+    def get_object(self):
+        return User.objects.get(pk=self.request.user.pk)
 
-    ``template_name`` keyword argument or
-    :template:`profiles/profile_detail.html`.
+    def form_valid(self, form):
+        user = self.get_object()
+        logout(self.request)
+        set_change_reason(user, self.get_change_reason())
+        user.delete()
+        return super().form_valid(form)
 
-    """
-    user = get_object_or_404(User, username=username)
-    try:
-        profile_obj = user.profile
-    except ObjectDoesNotExist:
-        raise Http404
-    if public_profile_field is not None and \
-       not getattr(profile_obj, public_profile_field):
-        profile_obj = None
+    def get_form(self, data=None, files=None, **kwargs):
+        kwargs["instance"] = self.get_object()
+        kwargs["initial"] = {"username": ""}
+        return super().get_form(data, files, **kwargs)
 
-    if extra_context is None:
-        extra_context = {}
-    context = RequestContext(request)
-    for key, value in extra_context.items():
-        context[key] = callable(value) and value() or value
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        user = self.request.user
+        context["projects_to_be_deleted"] = Project.objects.single_owner(user)
+        context["organizations_to_be_deleted"] = Organization.objects.single_owner(user)
+        return context
 
-    return render_to_response(template_name,
-                              {'profile': profile_obj},
-                              context_instance=context)
+    def get_success_url(self):
+        return reverse("homepage")
+
+    def get_change_reason(self):
+        klass = self.__class__.__name__
+        return f"origin=form class={klass}"
+
+
+class ProfileDetail(DetailView):
+    model = User
+    template_name = "profiles/public/profile_detail.html"
+    lookup_field = "username"
+
+    def get_object(self):
+        """
+        Get the user object.
+
+        If organizations are enabled, show the profile to users in the same organization only.
+        Otherwise, all users can see the profile of others.
+        """
+        user = super().get_object()
+        if not settings.RTD_ALLOW_ORGANIZATIONS:
+            return user
+
+        request_user = self.request.user
+        if not request_user.is_authenticated:
+            raise Http404()
+
+        # Always allow users to see their own profile.
+        if request_user == user:
+            return user
+
+        for org in Organization.objects.for_user(request_user):
+            if AdminPermission.is_member(user=user, obj=org):
+                return user
+        raise Http404()
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["profile"] = self.get_object().profile
+        return context
+
+
+class AccountAdvertisingEdit(PrivateViewMixin, SuccessMessageMixin, UpdateView):
+    model = UserProfile
+    form_class = UserAdvertisingForm
+    context_object_name = "profile"
+    template_name = "profiles/private/advertising_profile.html"
+    success_message = _("Updated your advertising preferences")
+
+    def get_object(self):
+        return self.request.user.profile
+
+    def get_success_url(self):
+        return reverse("account_advertising")
+
+
+class TokenMixin(PrivateViewMixin):
+
+    """User token to access APIv3."""
+
+    model = Token
+    lookup_url_kwarg = "token_pk"
+    template_name = "profiles/private/token_list.html"
+
+    def get_queryset(self):
+        # NOTE: we are currently showing just one token since the DRF model has
+        # a OneToOneField relation with User. Although, we plan to have multiple
+        # scope-based tokens.
+        return Token.objects.filter(user__in=[self.request.user])
+
+    def get_success_url(self):
+        return reverse("profiles_tokens")
+
+
+class TokenListView(TokenMixin, ListView):
+    pass
+
+
+class TokenCreateView(TokenMixin, CreateView):
+
+    """Simple view to generate a Token object for the logged in User."""
+
+    http_method_names = ["post"]
+
+    def post(self, request, *args, **kwargs):
+        _, created = Token.objects.get_or_create(user=self.request.user)
+        if created:
+            messages.info(request, "API Token created successfully")
+        return HttpResponseRedirect(self.get_success_url())
+
+
+class TokenDeleteView(TokenMixin, DeleteView):
+
+    """View to delete/revoke the current Token of the logged in User."""
+
+    http_method_names = ["post"]
+
+    def get_object(self, queryset=None):  # noqa
+        return self.request.user.auth_token
+
+
+class UserSecurityLogView(PrivateViewMixin, ListView):
+    model = AuditLog
+    template_name = "profiles/private/security_log.html"
+    days_limit = settings.RTD_AUDITLOGS_DEFAULT_RETENTION_DAYS
+
+    def get(self, request, *args, **kwargs):
+        download_data = request.GET.get("download", False)
+        if download_data:
+            return self._get_csv_data()
+        return super().get(request, *args, **kwargs)
+
+    def _get_start_date(self):
+        """Get the date to show logs from."""
+        creation_date = self.request.user.date_joined.date()
+        start_date = timezone.now().date() - timezone.timedelta(days=self.days_limit)
+        # The max we can go back is to the creation of the user.
+        return max(start_date, creation_date)
+
+    def _get_csv_data(self):
+        current_timezone = settings.TIME_ZONE
+        values = [
+            (f"Date ({current_timezone})", "created"),
+            ("User", "log_user_username"),
+            ("Project", "log_project_slug"),
+            ("Organization", "log_organization_slug"),
+            ("Action", "action"),
+            ("IP", "ip"),
+            ("Browser", "browser"),
+            ("Extra data", "data"),
+        ]
+        data = self.get_queryset().values_list(*[value for _, value in values])
+
+        start_date = self._get_start_date()
+        end_date = timezone.now().date()
+        date_filter = self.filter.form.cleaned_data.get("date")
+        if date_filter:
+            start_date = date_filter.start or start_date
+            end_date = date_filter.stop or end_date
+
+        filename = "readthedocs_user_security_logs_{username}_{start}_{end}.csv".format(
+            username=self.request.user.username,
+            start=timezone.datetime.strftime(start_date, "%Y-%m-%d"),
+            end=timezone.datetime.strftime(end_date, "%Y-%m-%d"),
+        )
+        csv_data = [
+            [timezone.datetime.strftime(date, "%Y-%m-%d %H:%M:%S"), *rest]
+            for date, *rest in data
+        ]
+        csv_data.insert(0, [header for header, _ in values])
+        return get_csv_file(filename=filename, csv_data=csv_data)
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["days_limit"] = self.days_limit
+        context["filter"] = self.filter
+        context["AuditLog"] = AuditLog
+        return context
+
+    def _get_queryset(self):
+        """Return the queryset without filters."""
+        user = self.request.user
+        start_date = self._get_start_date()
+        queryset = AuditLog.objects.filter(
+            user=user,
+            action__in=[action for action, _ in UserSecurityLogFilter.allowed_actions],
+            created__gte=start_date,
+        )
+        return queryset
+
+    def get_queryset(self):
+        """
+        Return the queryset with filters.
+
+        If you want the original queryset without filters,
+        use `_get_queryset`.
+        """
+        queryset = self._get_queryset()
+        # Set filter on self, so we can use it in the context.
+        # Without executing it twice.
+        self.filter = UserSecurityLogFilter(
+            self.request.GET,
+            queryset=queryset,
+        )
+        return self.filter.qs
